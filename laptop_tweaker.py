@@ -28,7 +28,7 @@ except ImportError:  # not on Windows
     winreg = None
 
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 # ---------- helpers ----------
@@ -265,6 +265,115 @@ def fetch_update(url):
     return m.group(1), code
 
 
+HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".laptop_tweaker_history.json")
+RP_CMD = 'Checkpoint-Computer -Description "Laptop Tweaker" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop'
+RISK_COLORS = {"Safe": "#34c759", "Moderate": "#ff9f0a", "Advanced": "#ff453a"}
+
+PS_SYSINFO = r"""
+$os = Get-CimInstance Win32_OperatingSystem
+$cs = Get-CimInstance Win32_ComputerSystem
+$bios = Get-CimInstance Win32_BIOS
+$disks = @(Get-PhysicalDisk | ForEach-Object {
+  $r = $_ | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+  $w = ""
+  if ($r -and $r.Wear -ne $null) { $w = ", wear " + $r.Wear + "%" }
+  $_.FriendlyName + ": " + $_.MediaType + ", health " + $_.HealthStatus + ", " + [math]::Round($_.Size/1GB) + " GB" + $w
+}) -join "; "
+[pscustomobject]@{
+  model = $cs.Manufacturer + " " + $cs.Model
+  cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+  gpudrv = (@(Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name + " (driver " + $_.DriverVersion + ")" }) -join "; ")
+  os = $os.Caption + " (build " + $os.BuildNumber + ")"
+  bios = $bios.SMBIOSBIOSVersion
+  boot = $os.LastBootUpTime.ToString("yyyy-MM-dd HH:mm")
+  disks = $disks
+} | ConvertTo-Json -Compress
+"""
+
+
+def load_hist():
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_hist(h):
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(h, f)
+    except OSError:
+        pass
+
+
+def reg_get(path, name):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except Exception:
+        return None
+
+
+def reg_delete(path, name):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, name)
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
+
+def plan_guid():
+    ok, out = run(["powercfg", "/getactivescheme"])
+    m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})", out) if ok else None
+    return m.group(1) if m else None
+
+
+def run_undo(u):
+    """Reverse a recorded change. u is one undo spec or a list of them."""
+    if isinstance(u, list):
+        return all([run_undo(x) for x in reversed(u)])
+    t = u.get("t")
+    if t == "reg":
+        if u["old"] is None:
+            return reg_delete(u["path"], u["name"])
+        return reg_dword(u["path"], u["name"], u["old"])
+    if t == "cmd":
+        return all([run(c)[0] for c in u["cmds"]])
+    if t == "plan":
+        return run(["powercfg", "/setactive", u["guid"]])[0]
+    if t == "cool_off":
+        return cool_mode(False)[0]
+    if t == "dns_auto":
+        return set_dns("auto")[0]
+    return False
+
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.w, self.text, self.tip = widget, text, None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _e=None):
+        if self.tip:
+            return
+        x, y = self.w.winfo_rootx() + 20, self.w.winfo_rooty() + 24
+        self.tip = tk.Toplevel(self.w)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, justify="left", wraplength=340, bg="#2b2d31", fg="#e6e6e6",
+                 relief="solid", borderwidth=1, padx=8, pady=6).pack()
+
+    def hide(self, _e=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 class Spark(tk.Canvas):
     """Tiny live line graph for the last 60 samples."""
     def __init__(self, master, color, **kw):
@@ -291,7 +400,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Laptop Tweaker")
-        self.geometry("720x740")
+        self.geometry("780x760")
         self.minsize(660, 600)
 
         self.style = ttk.Style(self)
@@ -305,14 +414,18 @@ class App(tk.Tk):
 
         tabs = ttk.Notebook(self)
         tabs.pack(fill="both", expand=True, padx=8, pady=8)
-        names = ("Home", "Network", "Optimize", "Power", "Cleanup", "Startup", "Details", "Updates")
+        names = ("Home", "Network", "Optimize", "Power", "Cleanup", "Startup", "System", "History", "Details", "Updates")
         fr = {n: ttk.Frame(tabs, padding=12) for n in names}
         for n in names:
             tabs.add(fr[n], text=n)
         self.home, self.net, self.opt, self.power = fr["Home"], fr["Network"], fr["Optimize"], fr["Power"]
         self.clean, self.startup, self.dash, self.upd = fr["Cleanup"], fr["Startup"], fr["Details"], fr["Updates"]
+        self.sysf, self.hist = fr["System"], fr["History"]
 
         self.sparks = []
+        self.ui_queue = []
+        self.hist_data = load_hist()
+        self.rp_done = False
         self.cfg = load_cfg()
         self.cpu_hist, self.ram_hist, self.ping_hist = deque(maxlen=60), deque(maxlen=60), deque(maxlen=60)
         self.ping_target = "1.1.1.1"
@@ -326,6 +439,8 @@ class App(tk.Tk):
         self.build_cleanup()
         self.build_startup()
         self.build_updates()
+        self.build_system()
+        self.build_history()
 
         psutil.cpu_percent(None)
         self.tick = 0
@@ -355,7 +470,7 @@ class App(tk.Tk):
         s.configure("TButton", background=c["btn"], foreground=c["fg"], borderwidth=0, padding=6)
         s.map("TButton", background=[("active", c["accent"])], foreground=[("active", "#ffffff")])
         s.configure("TNotebook", background=c["bg"], borderwidth=0)
-        s.configure("TNotebook.Tab", background=c["btn"], foreground=c["fg"], padding=(9, 6))
+        s.configure("TNotebook.Tab", background=c["btn"], foreground=c["fg"], padding=(7, 6))
         s.map("TNotebook.Tab", background=[("selected", c["accent"])], foreground=[("selected", "#ffffff")])
         s.configure("Treeview", background=c["field"], foreground=c["fg"], fieldbackground=c["field"], borderwidth=0)
         s.configure("Treeview.Heading", background=c["btn"], foreground=c["fg"])
@@ -431,6 +546,8 @@ class App(tk.Tk):
 
         self.temp_lbl.config(text=self.temp_text)
         self.refresh_home(cpu, vm.percent)
+        while self.ui_queue:
+            self.ui_queue.pop(0)()
         if self.update_msg:
             self.upd_lbl.config(text=self.update_msg)
             self.update_msg = ""
@@ -507,7 +624,10 @@ class App(tk.Tk):
         self.plan_lbl.config(text=out if ok else "Could not read power plan.")
 
     def set_plan(self, alias):
+        old = plan_guid()
         ok, out = run(["powercfg", "/setactive", alias])
+        if ok and old:
+            self.log("Power plan: " + alias, {"t": "plan", "guid": old})
         if not ok:
             messagebox.showwarning("Power plan", "Couldn't switch to that plan. Some laptops hide plans "
                                    "(especially High performance).\n\n" + out)
@@ -516,6 +636,8 @@ class App(tk.Tk):
     def manual_cool(self, on):
         ok, out = cool_mode(on, int(self.cpu_cap.get()))
         self.cooling = on
+        if ok and on:
+            self.log("Cool mode ON", {"t": "cool_off"})
         messagebox.showinfo("Cooling", ("Cool mode is ON." if on else "Back to normal.") if ok else out)
 
     def apply_cap(self):
@@ -669,17 +791,25 @@ class App(tk.Tk):
         self.net_lbl.config(text=f"Latency to {self.ping_target}: {sub}")
 
     def game_boost(self):
-        done = []
+        done, undo = [], []
+        old = plan_guid()
         if run(["powercfg", "/setactive", "SCHEME_MIN"])[0]:
             done.append("High performance power plan")
-        if reg_dword(GAMEBAR, "AutoGameModeEnabled", 1):
-            done.append("Game Mode on")
-        if reg_dword(PERSONALIZE, "EnableTransparency", 0):
-            done.append("Transparency effects off")
+            if old:
+                undo.append({"t": "plan", "guid": old})
+        for label, path, name, val in (("Game Mode on", GAMEBAR, "AutoGameModeEnabled", 1),
+                                       ("Transparency effects off", PERSONALIZE, "EnableTransparency", 0)):
+            u = self.reg_tweak(path, name, val)
+            if u:
+                done.append(label)
+                undo.append(u)
         if run(["ipconfig", "/flushdns"])[0]:
             done.append("DNS cache flushed")
+        if undo:
+            self.log("Game Boost", undo)
         self.refresh_plan()
-        messagebox.showinfo("Game Boost", ("Applied:\n- " + "\n- ".join(done)) if done else "Nothing could be applied.")
+        messagebox.showinfo("Game Boost", ("Applied:\n- " + "\n- ".join(done) + "\n\nUndo it any time on the History tab.")
+                            if done else "Nothing could be applied.")
 
     def quick_clean(self):
         if not messagebox.askyesno("Clean temp files", "Delete temporary files? Files in use are skipped."):
@@ -727,6 +857,8 @@ class App(tk.Tk):
 
     def dns(self, kind):
         ok, out = set_dns(kind)
+        if ok and kind != "auto":
+            self.log("DNS: " + kind, {"t": "dns_auto"})
         run(["ipconfig", "/flushdns"])
         messagebox.showinfo("DNS", ("DNS updated." if kind != "auto" else "DNS set to automatic.") if ok
                             else "Couldn't change DNS (run as Administrator).\n\n" + out)
@@ -739,25 +871,37 @@ class App(tk.Tk):
             self.hog_lbl.config(text="\n".join(f"{n}  -  {c} connections" for n, c in hogs) or "Nothing active.")
 
     # ----- Optimize -----
+    def tweak_defs(self):
+        return [
+            dict(name="Game Boost", risk="Safe", direct=True, fn=self.game_boost,
+                 why="Switches to the High performance plan, turns on Game Mode and turns off transparency. "
+                     "Good for games, but the laptop runs hotter and uses more battery. Fully undoable."),
+            dict(name="Transparency effects off", risk="Safe", reg=(PERSONALIZE, "EnableTransparency", 0),
+                 why="Removes see-through window effects. Saves a little graphics power and memory on a "
+                     "low-end integrated GPU."),
+            dict(name="Game Mode on", risk="Safe", reg=(GAMEBAR, "AutoGameModeEnabled", 1),
+                 why="Tells Windows to pause background tasks like updates while a game is running."),
+            dict(name="Hibernation off (frees disk)", risk="Moderate",
+                 cmd=(["powercfg", "/h", "off"], ["powercfg", "/h", "on"]),
+                 why="Deletes the hibernation file, freeing several GB. You lose Hibernate and Fast Startup. "
+                     "Undo turns it back on."),
+            dict(name="Empty Recycle Bin", risk="Moderate", rp=False, fn=empty_recycle,
+                 why="Permanently deletes everything in the Recycle Bin. This can't be undone."),
+        ]
+
     def build_optimize(self):
         bold = ("Segoe UI", 10, "bold")
-        ttk.Label(self.opt, text="One-click tweaks", font=bold).pack(anchor="w")
+        ttk.Label(self.opt, text="Tweaks (hover the ? for why it matters)", font=bold).pack(anchor="w")
         grid = ttk.Frame(self.opt)
         grid.pack(anchor="w", pady=6)
-        items = (
-            ("Game Boost", self.game_boost),
-            ("Transparency off", lambda: self.tweak(lambda: reg_dword(PERSONALIZE, "EnableTransparency", 0),
-                                                    "Transparency effects off (sign out and in to see it everywhere).")),
-            ("Transparency on", lambda: self.tweak(lambda: reg_dword(PERSONALIZE, "EnableTransparency", 1),
-                                                   "Transparency effects on.")),
-            ("Game Mode on", lambda: self.tweak(lambda: reg_dword(GAMEBAR, "AutoGameModeEnabled", 1), "Game Mode on.")),
-            ("Hibernation off (frees disk)", lambda: self.tweak(lambda: run(["powercfg", "/h", "off"])[0],
-                                                                "Hibernation off. This frees several GB and turns off Fast Startup.")),
-            ("Hibernation on", lambda: self.tweak(lambda: run(["powercfg", "/h", "on"])[0], "Hibernation on.")),
-            ("Empty Recycle Bin", lambda: self.tweak(empty_recycle, "Recycle Bin emptied.")),
-        )
-        for i, (txt, fn) in enumerate(items):
-            ttk.Button(grid, text=txt, command=fn, width=28).grid(row=i // 2, column=i % 2, padx=3, pady=3)
+        for i, t in enumerate(self.tweak_defs()):
+            ttk.Button(grid, text=t["name"], width=30, command=lambda t=t: self.apply_tweak(t)).grid(
+                row=i, column=0, padx=3, pady=3, sticky="w")
+            ttk.Label(grid, text=t["risk"], foreground=RISK_COLORS[t["risk"]], width=10).grid(row=i, column=1)
+            q = ttk.Label(grid, text="?", font=bold, width=3)
+            q.grid(row=i, column=2)
+            Tooltip(q, t["why"])
+        ttk.Label(self.opt, text="Every change is logged on the History tab, where it can be undone.").pack(anchor="w")
 
         ttk.Label(self.opt, text="Heaviest apps right now (memory)", font=bold).pack(anchor="w", pady=(14, 4))
         self.heavy = ttk.Treeview(self.opt, columns=("pid", "mem"), show="tree headings", height=9)
@@ -774,8 +918,38 @@ class App(tk.Tk):
         ttk.Button(row, text="End selected app", command=self.end_heavy).pack(side="left", padx=2)
         self.load_heavy()
 
-    def tweak(self, fn, text):
-        messagebox.showinfo("Optimize", text if fn() else "That didn't work (try running as Administrator).")
+    def reg_tweak(self, path, name, value):
+        old = reg_get(path, name)
+        if reg_dword(path, name, value):
+            return {"t": "reg", "path": path, "name": name, "old": old}
+        return None
+
+    def apply_tweak(self, t):
+        if t.get("direct"):
+            return t["fn"]()
+        if not self.safety(t["name"], t["risk"], t.get("rp", True)):
+            return
+        undo, ok = None, False
+        if "reg" in t:
+            undo = self.reg_tweak(*t["reg"])
+            ok = undo is not None
+        elif "cmd" in t:
+            ok = run(t["cmd"][0])[0]
+            undo = {"t": "cmd", "cmds": [t["cmd"][1]]}
+        elif "fn" in t:
+            ok = bool(t["fn"]())
+        if ok:
+            self.log(t["name"], undo)
+            messagebox.showinfo("Optimize", f"Done: {t['name']}.")
+        else:
+            messagebox.showwarning("Optimize", "That didn't work (try running as Administrator).")
+
+    def safety(self, name, risk, rp=True):
+        if risk == "Safe" or not rp or not self.rp_var.get() or self.rp_done:
+            return True
+        if self.make_restore_point():
+            return True
+        return messagebox.askyesno("No restore point", f'Couldn\'t create a restore point. Apply "{name}" anyway?')
 
     def load_heavy(self):
         self.heavy.delete(*self.heavy.get_children())
@@ -872,6 +1046,165 @@ class App(tk.Tk):
             return
         self.destroy()
         os._exit(0)
+
+    # ----- System info + battery -----
+    def build_system(self):
+        bold = ("Segoe UI", 10, "bold")
+        ttk.Label(self.sysf, text="System information", font=bold).pack(anchor="w")
+        self.sys_lbl = ttk.Label(self.sysf, text="Loading...", justify="left", wraplength=700)
+        self.sys_lbl.pack(anchor="w", pady=6)
+        ttk.Button(self.sysf, text="Refresh", command=self.load_sysinfo).pack(anchor="w")
+
+        ttk.Label(self.sysf, text="Battery health", font=bold).pack(anchor="w", pady=(18, 4))
+        self.batt_lbl = ttk.Label(self.sysf, text="Click the button to measure how much charge your battery "
+                                  "still holds compared with when it was new.", wraplength=700, justify="left")
+        self.batt_lbl.pack(anchor="w")
+        row = ttk.Frame(self.sysf)
+        row.pack(anchor="w", pady=6)
+        ttk.Button(row, text="Check battery health", command=self.battery_report).pack(side="left", padx=2)
+        ttk.Button(row, text="Open full report", command=self.open_battery_report).pack(side="left", padx=2)
+        self.load_sysinfo()
+
+    def load_sysinfo(self):
+        self.sys_lbl.config(text="Loading...")
+
+        def work():
+            ok, out = run(["powershell", "-NoProfile", "-Command", PS_SYSINFO])
+            try:
+                d = json.loads(out.strip().splitlines()[-1])
+            except Exception:
+                d = None
+            if d:
+                up = time.time() - psutil.boot_time()
+                text = "\n".join([
+                    f"Model:  {d['model']}",
+                    f"CPU:  {d['cpu']}  ({psutil.cpu_count(logical=False)} cores / {psutil.cpu_count()} threads)",
+                    f"RAM:  {fmt_bytes(psutil.virtual_memory().total)}",
+                    f"Graphics:  {d['gpudrv'].replace('; ', chr(10) + '    ')}",
+                    f"Windows:  {d['os']}",
+                    f"BIOS:  {d['bios']}",
+                    f"Last boot:  {d['boot']}   (up {int(up // 3600)}h {int(up % 3600 // 60)}m)",
+                    "Drives (health from Windows' storage data):",
+                    "    " + str(d["disks"]).replace("; ", "\n    "),
+                ])
+            else:
+                text = "Couldn't read system info (PowerShell may be blocked)."
+            self.ui_queue.append(lambda: self.sys_lbl.config(text=text))
+        threading.Thread(target=work, daemon=True).start()
+
+    def battery_path(self):
+        return os.path.join(tempfile.gettempdir(), "battery-report.html")
+
+    def battery_report(self):
+        self.batt_lbl.config(text="Measuring...")
+        path = self.battery_path()
+
+        def work():
+            ok, out = run(["powercfg", "/batteryreport", "/output", path])
+            msg = "Couldn't create a battery report (this PC may have no battery, or try Administrator)."
+            if ok and os.path.exists(path):
+                data = open(path, "rb").read()
+                html = data.decode("utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8", "ignore")
+                d = re.search(r"DESIGN CAPACITY.*?([\d,]+)\s*mWh", html, re.S | re.I)
+                f = re.search(r"FULL CHARGE CAPACITY.*?([\d,]+)\s*mWh", html, re.S | re.I)
+                if d and f:
+                    dv, fv = int(d.group(1).replace(",", "")), int(f.group(1).replace(",", ""))
+                    pct = fv / dv * 100 if dv else 0
+                    verdict = ("Healthy." if pct >= 80 else "Worn: expect shorter battery life." if pct >= 60
+                               else "Badly worn: a replacement battery is worth considering.")
+                    msg = (f"Built to hold {dv:,} mWh, now holds {fv:,} mWh = {pct:.0f}% of original. {verdict}")
+                else:
+                    msg = "Report created. Click 'Open full report' to read it."
+            self.ui_queue.append(lambda: self.batt_lbl.config(text=msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_battery_report(self):
+        path = self.battery_path()
+        if os.path.exists(path):
+            os.startfile(path)
+        else:
+            messagebox.showinfo("Battery", "Run 'Check battery health' first.")
+
+    # ----- History, undo and restore points -----
+    def build_history(self):
+        bold = ("Segoe UI", 10, "bold")
+        ttk.Label(self.hist, text="Safety net", font=bold).pack(anchor="w")
+        ttk.Label(self.hist, text="A restore point lets you roll Windows back (search 'Create a restore point' "
+                  "in Start) if a tweak causes trouble. Windows normally allows one per 24 hours.",
+                  wraplength=700, justify="left").pack(anchor="w", pady=4)
+        self.rp_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.hist, text="Make a restore point before Moderate/Advanced tweaks (once per session)",
+                        variable=self.rp_var).pack(anchor="w")
+        ttk.Button(self.hist, text="Create restore point now", command=lambda: self.make_restore_point(True)).pack(
+            anchor="w", pady=6)
+
+        ttk.Label(self.hist, text="Change history", font=bold).pack(anchor="w", pady=(14, 4))
+        self.hist_tree = ttk.Treeview(self.hist, columns=("time", "name", "status"), show="headings", height=12)
+        for col, txt, w in (("time", "When", 130), ("name", "Change", 330), ("status", "Status", 120)):
+            self.hist_tree.heading(col, text=txt)
+            self.hist_tree.column(col, width=w)
+        self.hist_tree.pack(fill="x")
+        row = ttk.Frame(self.hist)
+        row.pack(anchor="w", pady=6)
+        ttk.Button(row, text="Undo selected", command=self.undo_selected).pack(side="left", padx=2)
+        ttk.Button(row, text="Undo last change", command=self.undo_last).pack(side="left", padx=2)
+        self.refresh_history()
+
+    def refresh_history(self):
+        self.hist_tree.delete(*self.hist_tree.get_children())
+        for i, e in enumerate(self.hist_data):
+            status = "undone" if e.get("undone") else ("applied" if e.get("undo") else "can't undo")
+            self.hist_tree.insert("", 0, iid=str(i), values=(e["time"], e["name"], status))
+
+    def log(self, name, undo):
+        self.hist_data.append({"time": time.strftime("%Y-%m-%d %H:%M"), "name": name, "undo": undo, "undone": False})
+        del self.hist_data[:-100]
+        save_hist(self.hist_data)
+        self.refresh_history()
+
+    def _undo_index(self, i):
+        e = self.hist_data[i]
+        if e.get("undone"):
+            messagebox.showinfo("Undo", "That change was already undone.")
+        elif not e.get("undo"):
+            messagebox.showinfo("Undo", "This change can't be undone automatically.")
+        elif run_undo(e["undo"]):
+            e["undone"] = True
+            save_hist(self.hist_data)
+            self.refresh_history()
+            self.refresh_plan()
+            messagebox.showinfo("Undo", f"Undone: {e['name']}.")
+        else:
+            messagebox.showwarning("Undo", "Couldn't undo that (try running as Administrator).")
+
+    def undo_selected(self):
+        sel = self.hist_tree.selection()
+        if sel:
+            self._undo_index(int(sel[0]))
+        else:
+            messagebox.showinfo("Undo", "Select a change in the list first.")
+
+    def undo_last(self):
+        for i in range(len(self.hist_data) - 1, -1, -1):
+            if self.hist_data[i].get("undo") and not self.hist_data[i].get("undone"):
+                return self._undo_index(i)
+        messagebox.showinfo("Undo", "Nothing to undo.")
+
+    def make_restore_point(self, manual=False):
+        self.config(cursor="watch")
+        self.update_idletasks()
+        ok, out = run(["powershell", "-NoProfile", "-Command", RP_CMD])
+        self.config(cursor="")
+        if ok:
+            self.rp_done = True
+        if manual:
+            if ok:
+                messagebox.showinfo("Restore point", "Restore point requested. (Windows skips it if one was already "
+                                    "made in the last 24 hours.)")
+            else:
+                messagebox.showwarning("Restore point", "Couldn't create a restore point. Make sure System "
+                                       "Protection is on for drive C: and run as Administrator.\n\n" + out[:300])
+        return ok
 
 
 if __name__ == "__main__":
